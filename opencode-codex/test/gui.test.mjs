@@ -99,6 +99,23 @@ test('composer pill shows unknown usage for incomplete host metrics without hidi
   assert.ok(view.rows.some(r => r.label === 'Codex 7d: 90% left'));
 });
 
+test('composer pill shows host usage while the quota rows are loading', async () => {
+  const { plugin } = loadGui();
+  const pills = [];
+  const controller = new AbortController();
+  const status = { detail: { usage: { pending: true }, system: { cpu: { usedPercent: 45 } } } };
+  const session = { directory: '/repo', server: { id: 's', client: { rpc: () => ({ read: async () => status }) } } };
+  plugin.setup({ add: (_, item) => pills.push(item), signal: controller.signal });
+  controller.abort();
+  const pill = pills.find(item => item.id === 'status');
+  pill.show({ session });
+  await new Promise(r => setImmediate(r));
+  const view = pill.show({ session });
+  assert.equal(view.label, 'CPU 45% · RAM — · DISK —');
+  assert.equal(view.rows.find(row => row.id === 'claude-5h').label, 'Claude 5h: Loading…');
+  assert.equal(view.rows.find(row => row.id === 'codex-7d').label, 'Codex 7d: Loading…');
+});
+
 test('activity follows the routed SSH session and discards late replies', async t => {
   const { plugin, updateRoute } = loadGui();
   const controller = new AbortController();

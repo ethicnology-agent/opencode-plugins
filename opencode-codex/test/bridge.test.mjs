@@ -329,6 +329,98 @@ test('a completed request can be recovered without repeating execution', async t
   assert.equal(effects, 1);
 });
 
+test('changed system instructions cannot replay a completed user turn or return its old answer', async t => {
+  let effects = 0;
+  const { post } = await start(t, async () => {
+    effects++;
+    return { thread: 'thread', text: `Answer ${effects}` };
+  });
+  const system = content => ({ role: 'system', content });
+  const input = [system('First instructions'), user('Perform the effect')];
+  assert.equal((await post(input)).status, 200);
+  const identical = await post(input);
+  assert.equal((await identical.json()).choices[0].message.content, 'Answer 1');
+
+  const changed = await post([system('Changed instructions'), input[1]]);
+  assert.equal(changed.status, 400);
+  assert.equal((await changed.json()).error.type, 'codex_uncertain_turn');
+  assert.equal(effects, 1);
+
+  const next = await post([system('Changed instructions'), input[1], assistant('Answer 1'), input[1]]);
+  assert.equal((await next.json()).choices[0].message.content, 'Answer 2');
+  assert.equal(effects, 2);
+});
+
+test('changed developer instructions cannot restart an interrupted user turn', async t => {
+  let effects = 0;
+  const { post } = await start(t, async () => {
+    if (++effects === 1) throw new Error('Disconnected after the simulated effect');
+    return { thread: 'duplicate', text: 'Repeated effect' };
+  });
+  const developer = content => ({ role: 'developer', content });
+  const input = user('Perform the effect once');
+  assert.equal((await post([developer('First instructions'), input])).status, 400);
+  const changed = await post([developer('Changed instructions'), input]);
+  assert.equal(changed.status, 400);
+  assert.equal((await changed.json()).error.type, 'codex_uncertain_turn');
+  assert.equal(effects, 1);
+});
+
+test('a tool result for a lost delegation never starts a new Codex turn', { timeout: 3000 }, async t => {
+  let effects = 0;
+  const { post } = await start(t, async () => {
+    effects++;
+    return { thread: 'duplicate', text: 'Repeated effect' };
+  });
+  // The provider can present a valid result after the bridge has lost the parked turn.
+  const id = 'call_opencode_ended';
+  const result = await post([
+    user('Delegate once'),
+    { role: 'assistant', tool_calls: [{ id, type: 'function', function: { name: 'subagent', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: id, content: 'Late result' },
+    { role: 'system', content: 'Continue with the tool result' },
+  ]);
+  assert.equal(result.status, 400);
+  assert.equal((await result.json()).error.type, 'codex_expired_continuation');
+  assert.equal(effects, 0);
+});
+
+test('a live delegation can consume one result and replay the completed answer', { timeout: 3000 }, async t => {
+  let starts = 0;
+  let accept, finish;
+  const accepted = new Promise(resolve => { accept = resolve; });
+  const released = new Promise(resolve => { finish = resolve; });
+  const { post } = await start(t, async ({ delegationURL }) => {
+    starts++;
+    const response = await fetch(delegationURL, {
+      method: 'POST',
+      body: JSON.stringify({ method: 'tools/call', params: { name: 'subagent' } }),
+    });
+    const result = (await response.json()).content[0].text;
+    accept(result);
+    await released;
+    return { thread: 'thread', text: result };
+  });
+  const tools = [{ type: 'function', function: { name: 'subagent', parameters: { type: 'object' } } }];
+  const input = [user('Delegate once')];
+  const sent = await post(input, { tools });
+  const message = (await sent.json()).choices[0].message;
+  const continuation = [...input, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'Returned once' }];
+  const first = post(continuation, { tools });
+  try {
+    assert.equal(await accepted, 'Returned once');
+    const concurrent = await post(continuation, { tools });
+    assert.equal(concurrent.status, 400);
+    assert.equal((await concurrent.json()).error.type, 'codex_uncertain_turn');
+  } finally {
+    finish();
+  }
+  assert.equal((await (await first).json()).choices[0].message.content, 'Returned once');
+  const replay = await post(continuation, { tools });
+  assert.equal((await replay.json()).choices[0].message.content, 'Returned once');
+  assert.equal(starts, 1);
+});
+
 test('subagent activity is scoped to the current turn and exposes only display fields', async t => {
   let resolveTurn;
   let startTurn;

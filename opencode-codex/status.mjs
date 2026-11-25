@@ -22,8 +22,6 @@ export const StatusRpc = {
 const usageTtl = 2 * 60 * 1000;
 const sample = createSystemSampler();
 sample().catch(() => {}); // CPU usage needs a baseline; take it as soon as the module loads.
-let usage = { at: 0, claude: null, codex: null, errors: {} };
-let refreshing;
 
 async function claudeSdk(path) {
   if (path) return import(pathToFileURL(path).href);
@@ -38,38 +36,48 @@ async function claudeSdk(path) {
   throw new Error("Claude Agent SDK not found");
 }
 
-function refreshUsage(options) {
-  refreshing ??= (async () => {
-    const signal = AbortSignal.timeout(45_000);
-    const [claude, codex] = await Promise.allSettled([
-      claudeSdk(options.claudeSdk).then(sdk => readClaudeUsage({ sdk, signal })),
-      readCodexUsage({ signal }),
-    ]);
-    usage = {
-      at: Date.now(),
-      claude: claude.status === "fulfilled" ? claude.value : usage.claude && { ...usage.claude, stale: true },
-      codex: codex.status === "fulfilled" ? codex.value : usage.codex && { ...usage.codex, stale: true },
-      errors: Object.fromEntries([["claude", claude], ["codex", codex]].filter(([, r]) => r.status === "rejected").map(([k, r]) => [k, String(r.reason?.message ?? r.reason)])),
-    };
-  })().finally(() => { refreshing = undefined; });
-  return refreshing;
-}
+export function createStatusReader({
+  sample,
+  readClaude = (options, signal) => claudeSdk(options.claudeSdk).then(sdk => readClaudeUsage({ sdk, signal })),
+  readCodex = (_options, signal) => readCodexUsage({ signal }),
+  now = Date.now,
+}) {
+  let usage = { at: null, claude: null, codex: null, errors: {} };
+  let refreshing;
 
-export async function readStatus(options = {}) {
-  if (Date.now() - usage.at > usageTtl) {
-    const pending = refreshUsage(options);
-    if (!usage.at) await pending; // first read waits; later reads serve the cache while refreshing
+  function refreshUsage(options) {
+    refreshing ??= (async () => {
+      const signal = AbortSignal.timeout(45_000);
+      const [claude, codex] = await Promise.allSettled([
+        Promise.resolve().then(() => readClaude(options, signal)),
+        Promise.resolve().then(() => readCodex(options, signal)),
+      ]);
+      usage = {
+        at: now(),
+        claude: claude.status === "fulfilled" ? claude.value : usage.claude && { ...usage.claude, stale: true },
+        codex: codex.status === "fulfilled" ? codex.value : usage.codex && { ...usage.codex, stale: true },
+        errors: Object.fromEntries([["claude", claude], ["codex", codex]].filter(([, r]) => r.status === "rejected").map(([k, r]) => [k, String(r.reason?.message ?? r.reason)])),
+      };
+    })().finally(() => { refreshing = undefined; });
+    return refreshing;
   }
-  const system = await sample();
-  const usageTone = [usage.claude?.fiveHour, usage.claude?.weekly, usage.codex?.weekly]
-    .some(w => w?.remaining != null && w.remaining <= 10) ? "warning" : undefined;
-  const tone = systemTone(system) ?? usageTone ?? null;
-  return {
-    text: `${formatUsage(usage)} | ${formatSystem(system)}`,
-    tone,
-    detail: { usage, system },
+
+  return async function readStatus(options = {}) {
+    if (usage.at === null || now() - usage.at > usageTtl) void refreshUsage(options);
+    const system = await sample();
+    const snapshot = { ...usage, pending: usage.at === null && refreshing !== undefined };
+    const usageTone = [snapshot.claude?.fiveHour, snapshot.claude?.weekly, snapshot.codex?.weekly]
+      .some(w => w?.remaining != null && w.remaining <= 10) ? "warning" : undefined;
+    const tone = systemTone(system) ?? usageTone ?? null;
+    return {
+      text: `${formatUsage(snapshot)} | ${formatSystem(system)}`,
+      tone,
+      detail: { usage: snapshot, system },
+    };
   };
 }
+
+export const readStatus = createStatusReader({ sample });
 
 export async function registerStatus(ctx, options = {}) {
   const debug = entry => {

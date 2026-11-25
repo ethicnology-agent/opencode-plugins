@@ -128,7 +128,7 @@ function hostLabel(system) {
 function rows(status) {
   const usage = status.detail?.usage ?? {};
   const system = status.detail?.system;
-  const pct = w => (w?.remaining == null ? "?" : `${w.remaining}% left`);
+  const pct = w => (w?.remaining == null ? (usage.pending ? "Loading…" : "?") : `${w.remaining}% left`);
   const list = [
     { id: "claude-5h", label: `Claude 5h: ${pct(usage.claude?.fiveHour)}`, detail: when(usage.claude?.fiveHour?.resetsAt) },
     { id: "claude-7d", label: `Claude 7d: ${pct(usage.claude?.weekly)}`, detail: when(usage.claude?.weekly?.resetsAt) },

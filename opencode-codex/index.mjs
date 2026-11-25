@@ -165,6 +165,12 @@ class UncertainCodexTurn extends Error {
   }
 }
 
+class ExpiredCodexContinuation extends Error {
+  constructor() {
+    super("This subagent result no longer has a pending Codex turn. Check the existing subagent result before continuing.");
+  }
+}
+
 export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
   const key = randomUUID();
   const sessions = new Map();
@@ -224,16 +230,19 @@ export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
         const history = records.filter(({ role }) => role !== "instructions");
         session = req.headers["x-opencode-codex-session"];
         if (!session) throw new Error("Missing OpenCode session");
-        const fingerprint = createHash("sha256").update(JSON.stringify([session, body.messages])).digest("hex");
-        const recorded = requests.get(fingerprint);
+        // Instruction changes do not create a new turn, but invalidate exact answer replay.
+        const chat = body.messages.filter(message => message?.role !== "system" && message?.role !== "developer");
+        const turnKey = createHash("sha256").update(JSON.stringify([session, chat])).digest("hex");
+        const fingerprint = createHash("sha256").update(JSON.stringify([body.messages, body.tools])).digest("hex");
+        const recorded = requests.get(turnKey);
         const parked = delegated.get(session);
-        if (recorded?.result) {
+        if (recorded?.result && recorded.fingerprint === fingerprint) {
           result = recorded.result;
         } else if (recorded) {
           throw new UncertainCodexTurn();
         } else if (parked?.parked && parked.delegation.accept(body.messages)) {
-          receipt = {};
-          requests.set(fingerprint, receipt);
+          receipt = { fingerprint };
+          requests.set(turnKey, receipt);
           turn = parked;
           turn.parked = false;
           clearTimeout(turn.timeout);
@@ -242,8 +251,14 @@ export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
             thread: result.thread, history: [...history, { role: "assistant", text: result.text.trim() }],
           });
         } else {
+          const latest = chat.at(-1);
+          if (latest?.role === "tool" && latest.tool_call_id?.startsWith(callPrefix)) {
+            throw new ExpiredCodexContinuation();
+          }
           const last = history.at(-1);
-          if (last?.role !== "user") throw new Error("Expected a new user turn or pending OpenCode tool result");
+          if (latest?.role !== "user" || last?.role !== "user") {
+            throw new Error("Expected a new user turn or pending OpenCode tool result");
+          }
           if (busy.has(session)) { session = undefined; throw new Error("Missing or busy OpenCode session"); }
           const previous = sessions.get(session);
           const prior = history.slice(0, -1);
@@ -253,8 +268,8 @@ export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
           const thread = resumable ? previous.thread : undefined;
           trace({ kind, session, mode: resumable ? "resume" : prior.length ? "seed" : "new", prior: prior.length });
           sessions.delete(session);
-          receipt = {};
-          requests.set(fingerprint, receipt);
+          receipt = { fingerprint };
+          requests.set(turnKey, receipt);
           busy.set(session, controller);
           const tool = body.tools?.find(item => item.type === "function" && item.function?.name === "subagent")?.function;
           if (tool?.parameters && server.address()) {
@@ -315,7 +330,8 @@ export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
       if (!res.destroyed) {
         res.writeHead(400, { "content-type": "application/json" });
         const type = error instanceof IncompleteCodexTurn ? "codex_incomplete_turn"
-          : error instanceof UncertainCodexTurn ? "codex_uncertain_turn" : "invalid_request_error";
+          : error instanceof UncertainCodexTurn ? "codex_uncertain_turn"
+          : error instanceof ExpiredCodexContinuation ? "codex_expired_continuation" : "invalid_request_error";
         res.end(JSON.stringify({ error: { message: error.message, type } }));
       }
     } finally {

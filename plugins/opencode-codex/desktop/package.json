@@ -1,0 +1,9 @@
+{
+  "name": "ethicnology-status-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenCode Desktop pill: Claude/Codex subscription usage and host load of the session's server.",
+  "exports": {
+    "./gui-experimental": "./gui-experimental.cjs"
+  }
+}

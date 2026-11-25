@@ -114,6 +114,17 @@ function when(iso) {
   return Number.isNaN(date.getTime()) ? undefined : `resets ${date.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })}`;
 }
 
+function hostLabel(system) {
+  const percent = value => Number.isFinite(value) ? `${Math.max(0, Math.min(100, Math.round(value)))}%` : "—";
+  const used = (available, total) => Number.isFinite(available) && Number.isFinite(total) && total > 0
+    ? percent(100 * (1 - available / total))
+    : "—";
+  const cpu = percent(system?.cpu?.usedPercent);
+  const ram = used(system?.ram?.availableGiB, system?.ram?.totalGiB);
+  const disk = used(system?.disk?.freeGiB, system?.disk?.totalGiB);
+  return `CPU ${cpu} · RAM ${ram} · DISK ${disk}`;
+}
+
 function rows(status) {
   const usage = status.detail?.usage ?? {};
   const system = status.detail?.system;
@@ -178,7 +189,7 @@ const plugin = Plugin.define({
         }
         const status = entry.status ?? {};
         return {
-          label: status.text ?? "Status",
+          label: hostLabel(status.detail?.system),
           tone: status.tone === "danger" || status.tone === "warning" ? status.tone : undefined,
           title: `Usage and load on ${session.server.name ?? session.server.id}`,
           rows: rows(status),

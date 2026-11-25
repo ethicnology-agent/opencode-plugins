@@ -1,11 +1,13 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { appendFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 import { ActivityRpc, createActivity } from "./activity.mjs";
+import { callPrefix, createDelegation } from "./delegation.mjs";
 import { registerStatus } from "./status.mjs";
 
 const providerID = "codex-cli";
@@ -27,18 +29,24 @@ class IncompleteCodexTurn extends Error {
   }
 }
 
-export function execTurn({ cwd, prompt, thread, ephemeral = false, signal, onCollaboration }) {
+export function execTurn({ cwd, prompt, thread, ephemeral = false, signal, delegationURL, nodeCommand = "node", onCollaboration }) {
   const args = [
     "exec", ...(thread ? ["resume"] : []), "--json", "--ignore-user-config",
     ...(ephemeral && !thread ? ["--ephemeral"] : []),
-    "-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"',
+    "-c", ephemeral ? 'sandbox_mode="read-only"' : 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"',
+    ...(delegationURL ? [
+      "--disable", "multi_agent", "--disable", "multi_agent_v2",
+      "-c", `mcp_servers.opencode.command=${JSON.stringify(nodeCommand)}`,
+      "-c", `mcp_servers.opencode.args=${JSON.stringify([fileURLToPath(new URL("./subagent-mcp.mjs", import.meta.url)), delegationURL])}`,
+      "-c", "mcp_servers.opencode.tool_timeout_sec=300",
+    ] : []),
     "-c", "features.hooks=false", "-m", model, "--skip-git-repo-check",
     ...(thread ? [thread] : []), "-",
   ];
   const proc = spawn("codex", args, { cwd, detached: true, stdio: ["pipe", "pipe", "ignore"] });
-  const completion = once(proc, "close");
-  // Attach a rejection handler immediately; the spawn can fail before stdout closes.
-  completion.catch(() => {});
+  let processError;
+  proc.on("error", error => { processError = error; });
+  const completion = new Promise(resolve => proc.once("close", resolve));
   const terminate = (sig) => {
     if (!proc.pid) return;
     try { process.kill(-proc.pid, sig); }
@@ -46,6 +54,7 @@ export function execTurn({ cwd, prompt, thread, ephemeral = false, signal, onCol
   };
   let escalation;
   const stop = () => {
+    if (escalation) return;
     terminate("SIGTERM");
     escalation = setTimeout(() => terminate("SIGKILL"), 1000);
     escalation.unref();
@@ -73,17 +82,22 @@ export function execTurn({ cwd, prompt, thread, ephemeral = false, signal, onCol
         if (event.type === "turn.completed") { complete = true; usage = event.usage; }
         if (event.type === "turn.failed") failed = true;
       }
-      const [code] = await completion;
+      const code = await completion;
       if (signal.aborted) throw new Error("Codex interrupted");
+      if (processError) throw processError;
       if (id && !complete && !failed) throw new IncompleteCodexTurn();
       if (code !== 0 || !complete || failed || !id || !messages.at(-1)) {
         throw new Error("Codex did not complete the turn; check the local CLI and its login");
       }
       if (thread && id !== thread) throw new Error("Codex returned a different thread");
       return { thread: id, text: messages.at(-1), usage };
+    } catch (error) {
+      if (proc.exitCode === null && proc.signalCode === null && proc.pid) stop();
+      await completion;
+      throw error;
     } finally {
       signal.removeEventListener("abort", stop);
-      if (escalation && !signal.aborted) clearTimeout(escalation);
+      clearTimeout(escalation);
     }
   })();
 }
@@ -103,9 +117,10 @@ export function conversation(messages) {
   const records = [];
   for (const message of messages) {
     const role = message?.role;
+    if (role === "tool" && message.tool_call_id?.startsWith(callPrefix)) continue;
     let text = contentText(message?.content).trim();
     if (role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length) {
-      const calls = message.tool_calls.map(call => `[tool call ${call?.function?.name ?? "unknown"}] ${call?.function?.arguments ?? ""}`.trim());
+      const calls = message.tool_calls.filter(call => !call.id?.startsWith(callPrefix)).map(call => `[tool call ${call?.function?.name ?? "unknown"}] ${call?.function?.arguments ?? ""}`.trim());
       text = [text, ...calls].filter(Boolean).join("\n");
     }
     if (!text) continue;
@@ -126,7 +141,7 @@ function seededPrompt(prior, message) {
   return [
     "You are taking over a conversation that started in OpenCode, possibly with another agent or model.",
     "Its visible transcript follows. Tool calls shown in it were executed by the previous agent, not by you.",
-    "Continue the conversation by answering the new user message.",
+    "Continue by answering the new user message only. Earlier requests may already have caused side effects, even when no answer is shown. Do not repeat their actions unless the new message explicitly asks you to.",
     "", "<transcript>", transcript(prior), "</transcript>", "", "New user message:", message,
   ].join("\n");
 }
@@ -144,21 +159,35 @@ function oneShotPrompt(records) {
   ].join("\n");
 }
 
-export function createBridge({ cwd, execute = execTurn }) {
+class UncertainCodexTurn extends Error {
+  constructor() {
+    super("Codex may have already acted on this request. Check its effects before sending a new turn.");
+  }
+}
+
+export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
   const key = randomUUID();
   const sessions = new Map();
   const busy = new Map();
+  const requests = new Map();
+  const delegated = new Map();
+  const endpoints = new Map();
   const activity = createActivity();
   const server = createServer(async (req, res) => {
-    if (req.method !== "POST" || req.url !== "/v1/chat/completions" ||
-        req.headers.origin || req.headers["x-opencode-codex-key"] !== key) {
+    const delegation = endpoints.get(req.url);
+    if (req.method !== "POST" || req.headers.origin ||
+        (!delegation && (req.url !== "/v1/chat/completions" || req.headers["x-opencode-codex-key"] !== key))) {
       res.writeHead(404).end();
       return;
     }
     const controller = new AbortController();
-    res.once("close", () => controller.abort());
+    let turn;
+    res.once("close", () => {
+      if (!res.writableFinished || !turn?.parked) controller.abort();
+      if (!res.writableFinished) turn?.controller.abort();
+    });
     res.setHeader("connection", "close");
-    let session, turnActivity;
+    let session, receipt, turnActivity;
     try {
       const parts = [];
       let total = 0;
@@ -168,12 +197,20 @@ export function createBridge({ cwd, execute = execTurn }) {
         parts.push(part);
       }
       const body = JSON.parse(Buffer.concat(parts));
+      if (controller.signal.aborted || res.destroyed) return;
+      if (delegation) {
+        const result = await delegation.request(body);
+        if (res.destroyed) return;
+        if (!result) { res.writeHead(400).end(); return; }
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(result));
+        return;
+      }
       const kind = req.headers["x-opencode-codex-kind"];
       const records = conversation(body.messages);
       if (process.env.OPENCODE_CODEX_TRACE_SHAPE) {
         trace({ kind, shape: (body.messages ?? []).map(m => `${m.role}:${JSON.stringify(m.content ?? "").length}`) });
       }
-      let result;
+      let result, calls;
       if (kind === "title") {
         result = { text: "Codex CLI" };
       } else if (kind !== "primary") {
@@ -185,44 +222,64 @@ export function createBridge({ cwd, execute = execTurn }) {
         if (controller.signal.aborted) throw new Error("Codex interrupted");
       } else {
         const history = records.filter(({ role }) => role !== "instructions");
-        const last = history.at(-1);
-        if (last?.role !== "user") throw new Error("Expected a new user turn");
         session = req.headers["x-opencode-codex-session"];
-        if (!session || busy.has(session)) { session = undefined; throw new Error("Missing or busy OpenCode session"); }
-        const previous = sessions.get(session);
-        const prior = history.slice(0, -1);
-        // Resume when OpenCode's visible history is what this thread produced, possibly followed by
-        // user messages only (an interrupted or steered turn). Otherwise (agent switch, compaction,
-        // edit, fork, bridge restart) start a new Codex thread seeded with the visible transcript.
-        const known = previous?.history ?? [];
-        const extendsThread = previous && prior.length >= known.length &&
-          JSON.stringify(prior.slice(0, known.length)) === JSON.stringify(known) &&
-          prior.slice(known.length).every(({ role }) => role === "user");
-        const pending = extendsThread ? prior.slice(known.length) : [];
-        const prompt = extendsThread
-          ? pending.length
-            ? ["Messages sent since your last reply (an earlier turn may have been interrupted):",
-                ...pending.map(({ text }) => text), "", "Latest message:", last.text].join("\n")
-            : last.text
-          : prior.length ? seededPrompt(prior, last.text) : last.text;
-        const thread = extendsThread ? previous.thread : undefined;
-        trace({ kind, session, mode: extendsThread ? (pending.length ? "resume-pending" : "resume") : prior.length ? "seed" : "new", prior: prior.length });
-        sessions.delete(session);
-        busy.set(session, controller);
-        turnActivity = activity.start(session);
-        try {
-          result = await execute({
-            cwd, prompt, thread, signal: controller.signal, onCollaboration: turnActivity.record,
+        if (!session) throw new Error("Missing OpenCode session");
+        const fingerprint = createHash("sha256").update(JSON.stringify([session, body.messages])).digest("hex");
+        const recorded = requests.get(fingerprint);
+        const parked = delegated.get(session);
+        if (recorded?.result) {
+          result = recorded.result;
+        } else if (recorded) {
+          throw new UncertainCodexTurn();
+        } else if (parked?.parked && parked.delegation.accept(body.messages)) {
+          receipt = {};
+          requests.set(fingerprint, receipt);
+          turn = parked;
+          turn.parked = false;
+          clearTimeout(turn.timeout);
+          ({ result, calls } = await nextDelegated(turn));
+          if (result) sessions.set(session, {
+            thread: result.thread, history: [...history, { role: "assistant", text: result.text.trim() }],
           });
+        } else {
+          const last = history.at(-1);
+          if (last?.role !== "user") throw new Error("Expected a new user turn or pending OpenCode tool result");
+          if (busy.has(session)) { session = undefined; throw new Error("Missing or busy OpenCode session"); }
+          const previous = sessions.get(session);
+          const prior = history.slice(0, -1);
+          // A thread is resumable only after a confirmed, visible reply.
+          const resumable = previous && JSON.stringify(prior) === JSON.stringify(previous.history);
+          const prompt = resumable || !prior.length ? last.text : seededPrompt(prior, last.text);
+          const thread = resumable ? previous.thread : undefined;
+          trace({ kind, session, mode: resumable ? "resume" : prior.length ? "seed" : "new", prior: prior.length });
+          sessions.delete(session);
+          receipt = {};
+          requests.set(fingerprint, receipt);
+          busy.set(session, controller);
+          const tool = body.tools?.find(item => item.type === "function" && item.function?.name === "subagent")?.function;
+          if (tool?.parameters && server.address()) {
+            const route = `/mcp/${randomUUID()}`;
+            const bridge = createDelegation(tool, controller.signal);
+            endpoints.set(route, bridge);
+            turn = { controller, delegation: bridge, route };
+            delegated.set(session, turn);
+            controller.signal.addEventListener("abort", () => finishDelegation(session, turn), { once: true });
+            turn.execution = Promise.resolve().then(() => execute({
+              cwd, thread, signal: controller.signal, nodeCommand,
+              prompt: "Use the OpenCode subagent tool for delegation. Follow its instructions for background results.\n\n" + prompt,
+              delegationURL: `http://127.0.0.1:${server.address().port}${route}`,
+            })).then(result => ({ result }), error => ({ error }));
+            ({ result, calls } = await nextDelegated(turn));
+          } else {
+            // Native OpenCode subagents have their own activity UI. Only report CLI collaboration.
+            turnActivity = activity.start(session);
+            result = await execute({ cwd, prompt, thread, signal: controller.signal, onCollaboration: turnActivity.record });
+          }
           if (controller.signal.aborted) throw new Error("Codex interrupted");
-        } catch (error) {
-          // Keep the thread for a resumed turn: the next turn resends every user message since the
-          // last confirmed reply. A failed first turn has no confirmed thread and reseeds instead.
-          if (thread) sessions.set(session, { thread, history: known });
-          throw error;
+          if (result) sessions.set(session, { thread: result.thread, history: [...history, { role: "assistant", text: result.text.trim() }] });
         }
-        sessions.set(session, { thread: result.thread, history: [...history, { role: "assistant", text: result.text.trim() }] });
       }
+      if (receipt && result) receipt.result = result;
       const id = `chatcmpl-${randomUUID()}`;
       const common = { id, created: Math.floor(Date.now() / 1000), model };
       // Codex reports usage summed over every model call of the turn, including its own tool
@@ -230,10 +287,14 @@ export function createBridge({ cwd, execute = execTurn }) {
       // which also discards the Codex thread. Report the visible conversation size instead.
       const visible = records.filter(({ role }) => role !== "instructions").reduce((sum, { text }) => sum + text.length, 0);
       const prompt_tokens = Math.ceil(visible / 4);
-      const completion_tokens = Math.ceil(result.text.length / 4);
+      const completion_tokens = Math.ceil((result?.text.length ?? 0) / 4);
       const usage = { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens };
+      const finish = calls ? "tool_calls" : "stop";
       if (body.stream) {
-        const chunks = [[{ role: "assistant", content: result.text }, null], [{}, "stop"]]
+        const delta = calls
+          ? { role: "assistant", tool_calls: calls.map((call, index) => ({ ...call, index })) }
+          : { role: "assistant", content: result.text };
+        const chunks = [[delta, null], [{}, finish]]
           .map(([delta, reason]) => ({ ...common, object: "chat.completion.chunk",
             choices: [{ index: 0, delta, finish_reason: reason }] }));
         chunks.push({ ...common, object: "chat.completion.chunk", choices: [], usage });
@@ -247,22 +308,46 @@ export function createBridge({ cwd, execute = execTurn }) {
       } else {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ...common, object: "chat.completion", usage,
-          choices: [{ index: 0, message: { role: "assistant", content: result.text }, finish_reason: "stop" }] }));
+          choices: [{ index: 0, message: { role: "assistant", content: result?.text ?? null, ...(calls && { tool_calls: calls }) }, finish_reason: finish }] }));
       }
     } catch (error) {
       trace({ error: error.message });
       if (!res.destroyed) {
         res.writeHead(400, { "content-type": "application/json" });
-        const type = error instanceof IncompleteCodexTurn ? "codex_incomplete_turn" : "invalid_request_error";
+        const type = error instanceof IncompleteCodexTurn ? "codex_incomplete_turn"
+          : error instanceof UncertainCodexTurn ? "codex_uncertain_turn" : "invalid_request_error";
         res.end(JSON.stringify({ error: { message: error.message, type } }));
       }
     } finally {
-      if (session && busy.get(session) === controller) {
-        turnActivity.finish();
+      if (turn && !turn.parked) await finishDelegation(session, turn);
+      else if (!turn && session && busy.get(session) === controller) {
+        turnActivity?.finish();
         busy.delete(session);
       }
     }
   });
+  async function finishDelegation(session, turn) {
+    clearTimeout(turn.timeout);
+    endpoints.delete(turn.route);
+    turn.delegation.close();
+    await turn.execution;
+    if (delegated.get(session) !== turn) return;
+    delegated.delete(session);
+    busy.delete(session);
+  }
+
+  async function nextDelegated(turn) {
+    const outcome = await turn.delegation.next(turn.execution);
+    if (turn.controller.signal.aborted) throw new Error("Codex interrupted");
+    if (outcome.error) throw outcome.error;
+    if (outcome.calls) {
+      turn.parked = true;
+      turn.timeout = setTimeout(() => turn.controller.abort(), 300_000);
+      turn.timeout.unref();
+    }
+    return outcome;
+  }
+
   return {
     key, server, activity: activity.read,
     interrupt(session) { busy.get(session)?.abort(); },
@@ -285,14 +370,13 @@ export default {
     const cwd = await realpath(ctx.location.directory);
     if (ctx.options?.allowAllDirectories !== true &&
         (!ctx.options?.directory || cwd !== await realpath(ctx.options.directory))) return disposeStatus;
-    const bridge = createBridge({ cwd });
+    const nodeCommand = typeof ctx.options?.nodeCommand === "string" ? ctx.options.nodeCommand : undefined;
+    const bridge = createBridge({ cwd, nodeCommand });
     bridge.server.listen(0, "127.0.0.1");
     await once(bridge.server, "listening");
     const baseURL = `http://127.0.0.1:${bridge.server.address().port}/v1`;
-    const events = new AbortController();
     let activityRegistration;
     const close = async () => {
-      events.abort();
       bridge.close();
       disposeStatus();
       await activityRegistration?.dispose();
@@ -315,7 +399,7 @@ export default {
         },
         models: [{
           id: model, modelID: model, providerID, name: "Codex CLI / GPT-6.2 Sol",
-          capabilities: { tools: false, input: ["text"], output: ["text"] },
+          capabilities: { tools: true, input: ["text"], output: ["text"] },
           variants: [], time: { released: 0 }, cost: [], status: "active", enabled: true,
           limit: { context: 128000, output: 16000 },
         }],
@@ -326,13 +410,9 @@ export default {
         request.headers["x-opencode-codex-kind"] = request.kind;
         if (request.sessionID) request.headers["x-opencode-codex-session"] = request.sessionID;
       }, { providerID });
-      void (async () => {
-        for await (const event of ctx.event.subscribe({ signal: events.signal })) {
-          if (event.type === "session.execution.interrupted" || event.type === "session.execution.failed") {
-            bridge.interrupt(event.data?.sessionID);
-          }
-        }
-      })().catch(() => {});
+      // OpenCode 2.4.1 emits session-wide interruption events without identifying the
+      // execution. A delayed event could cancel a later turn. Use the owning response
+      // connection for cancellation and the delegation timeout while between requests.
       return close;
     } catch (error) {
       await close();

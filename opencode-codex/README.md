@@ -7,9 +7,9 @@ Experimental local OpenCode 2 plugin, two parts:
 
 ## Codex bridge
 
-- Codex owns its agent loop and tools, `danger-full-access` sandbox (full write and network access), no interactive approvals. OpenCode tools and permissions are not bridged; OpenCode shows the final text only.
-- One Codex thread per OpenCode session while the server runs. The thread is resumed when OpenCode's visible history is what the thread produced, optionally followed by user messages only (interrupted or steered turns); those messages are resent. Any other change (agent switch, compaction, revert, fork, server restart) starts a new Codex thread seeded with the visible transcript (truncated to the last 400k characters).
-- Compaction, title and other auxiliary requests run as one isolated `codex exec --ephemeral` turn.
+- Codex owns its agent loop and local tools, with `danger-full-access` and no interactive CLI approvals for primary turns. If OpenCode offers its `subagent` tool, Codex delegates through that native tool under OpenCode's subagent permissions. This path needs Node on the server's `PATH`, or an absolute executable path in the `nodeCommand` plugin option. OpenCode receives the final Codex text, not incremental text.
+- A Codex thread resumes only when the visible history matches its last confirmed reply. An interruption or other divergence starts a new thread from the visible transcript (truncated to the last 400k characters), without automatically re-executing earlier requests. Request replay protection is in memory and does not survive a server restart.
+- Auxiliary model calls use isolated, read-only `codex exec --ephemeral` turns. Title requests return a fixed title.
 - Usage reported to OpenCode is an estimate of the visible conversation, not Codex's cumulative per-turn usage, which triggered spurious compactions.
 - Diagnostics: `OPENCODE_CODEX_TRACE=/path/file.jsonl` logs routing decisions (no message content); `OPENCODE_CODEX_TRACE_SHAPE=1` adds message roles and sizes.
 
@@ -24,7 +24,7 @@ Experimental local OpenCode 2 plugin, two parts:
 
 ## Codex subagent activity in Desktop
 
-The Desktop plugin reads the active session's activity from its own server over RPC. The pill appears when the CLI reports a collaboration event. It shows the last reported state and action for each agent, and keeps the last turn's report visible for up to one minute. Prompts, tool output and thread identifiers are excluded. The CLI's JSON event stream can omit agent identifiers, so the pill falls back to the last reported action when individual agents cannot be identified.
+Native OpenCode subagents appear in OpenCode's own session UI. When no native subagent tool is offered, the Desktop pill reads Codex CLI collaboration activity from the session's server over RPC. It shows the last reported state and action for each agent, and keeps the last turn's report visible for up to one minute. Prompts, tool output and thread identifiers are excluded. The CLI's JSON event stream can omit agent identifiers, so the pill falls back to the last reported action when individual agents cannot be identified.
 
 Update both the server plugin and the Desktop-only package on the laptop. The Desktop application itself requires no changes.
 

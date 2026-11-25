@@ -26,4 +26,4 @@ After updating both hosts, compare `git rev-parse HEAD`. Reload OpenCode if the 
 
 ## Maintaining Claude
 
-Keep the fork's `main` aligned with upstream and use topic branches for proposed upstream changes. Import a reviewed source revision into the monorepo with `git subtree merge --prefix=opencode-claude <revision>` after fetching it. Keep the MIT license and avoid publishing private monorepo content to the public fork.
+Keep the fork's `main` aligned with upstream and use topic branches for proposed upstream changes. Import a reviewed source revision into the monorepo with `git subtree merge --prefix=opencode-claude <revision>` after fetching it. Preserve the MIT license and send only Claude subtree changes to the fork.

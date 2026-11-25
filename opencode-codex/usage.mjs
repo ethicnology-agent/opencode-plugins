@@ -9,11 +9,19 @@ const iso = value => (value == null ? null : new Date(typeof value === "number" 
 
 // Codex App Server `account/rateLimits/read` over stdio JSON-RPC.
 export async function readCodexUsage({ signal, command = "codex" } = {}) {
+  signal?.throwIfAborted();
   const proc = spawn(command, ["app-server"], { stdio: ["pipe", "pipe", "ignore"], detached: true });
   const stop = () => { try { process.kill(-proc.pid, "SIGTERM"); } catch {} };
-  signal?.addEventListener("abort", stop, { once: true });
   proc.stdin.on("error", () => {});
   const pending = new Map();
+  let failure;
+  const fail = error => {
+    failure ??= error;
+    for (const waiter of pending.values()) waiter.reject(failure);
+    pending.clear();
+  };
+  const abort = () => { fail(signal.reason ?? new Error("Codex usage request aborted")); stop(); };
+  signal?.addEventListener("abort", abort, { once: true });
   let next = 1;
   const lines = createInterface({ input: proc.stdout, crlfDelay: Infinity });
   lines.on("line", line => {
@@ -25,12 +33,12 @@ export async function readCodexUsage({ signal, command = "codex" } = {}) {
     message.error ? waiter.reject(new Error(message.error.message ?? "Codex app-server error")) : waiter.resolve(message.result);
   });
   const call = (method, params) => new Promise((resolve, reject) => {
+    if (failure !== undefined) return reject(failure);
     const id = next++;
     pending.set(id, { resolve, reject });
     proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
   });
-  const exited = once(proc, "exit").then(() => { for (const w of pending.values()) w.reject(new Error("Codex app-server exited")); });
-  exited.catch(() => {});
+  void once(proc, "close").then(() => fail(new Error("Codex app-server exited")), fail);
   try {
     await call("initialize", { clientInfo: { name: "opencode-codex-usage", version: "0.1.0" } });
     proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "initialized" })}\n`);
@@ -41,7 +49,7 @@ export async function readCodexUsage({ signal, command = "codex" } = {}) {
     const weekly = windows.find(w => w.windowDurationMins === 10080) ?? windows.sort((a, b) => (b.windowDurationMins ?? 0) - (a.windowDurationMins ?? 0))[0];
     return { weekly: weekly ? { remaining: remaining(weekly.usedPercent), resetsAt: iso(weekly.resetsAt) } : null };
   } finally {
-    signal?.removeEventListener("abort", stop);
+    signal?.removeEventListener("abort", abort);
     stop();
     lines.close();
   }

@@ -15,6 +15,22 @@ const model = "gpt-6.2-sol";
 const maxRequest = 32 * 1024 * 1024;
 // Characters of visible history replayed when a Codex thread must be (re)seeded.
 const maxSeed = 400_000;
+const defaultDelegationTimeoutSeconds = 900;
+const shimGraceSeconds = 15;
+const mcpGraceSeconds = 30;
+
+function delegationTimeout(value = defaultDelegationTimeoutSeconds) {
+  if (!Number.isInteger(value) || value < 1 || value > 3600) {
+    throw new RangeError("delegationTimeoutSeconds must be an integer from 1 to 3600");
+  }
+  return value;
+}
+
+function scheduleParkedExpiry(callback, delay) {
+  const timer = setTimeout(callback, delay);
+  timer.unref();
+  return () => clearTimeout(timer);
+}
 
 // Optional diagnostics: set OPENCODE_CODEX_TRACE to a file path to log routing decisions (no message content).
 function trace(entry) {
@@ -29,7 +45,10 @@ class IncompleteCodexTurn extends Error {
   }
 }
 
-export function execTurn({ cwd, prompt, thread, ephemeral = false, signal, delegationURL, nodeCommand = "node", onCollaboration }) {
+export function execTurn({
+  cwd, prompt, thread, ephemeral = false, signal, delegationURL, nodeCommand = "node",
+  delegationTimeoutSeconds = defaultDelegationTimeoutSeconds, onCollaboration,
+}) {
   const args = [
     "exec", ...(thread ? ["resume"] : []), "--json", "--ignore-user-config",
     ...(ephemeral && !thread ? ["--ephemeral"] : []),
@@ -37,8 +56,12 @@ export function execTurn({ cwd, prompt, thread, ephemeral = false, signal, deleg
     ...(delegationURL ? [
       "--disable", "multi_agent", "--disable", "multi_agent_v2",
       "-c", `mcp_servers.opencode.command=${JSON.stringify(nodeCommand)}`,
-      "-c", `mcp_servers.opencode.args=${JSON.stringify([fileURLToPath(new URL("./subagent-mcp.mjs", import.meta.url)), delegationURL])}`,
-      "-c", "mcp_servers.opencode.tool_timeout_sec=300",
+      "-c", `mcp_servers.opencode.args=${JSON.stringify([
+        fileURLToPath(new URL("./subagent-mcp.mjs", import.meta.url)),
+        delegationURL,
+        String((delegationTimeoutSeconds + shimGraceSeconds) * 1000),
+      ])}`,
+      "-c", `mcp_servers.opencode.tool_timeout_sec=${delegationTimeoutSeconds + mcpGraceSeconds}`,
     ] : []),
     "-c", "features.hooks=false", "-m", model, "--skip-git-repo-check",
     ...(thread ? [thread] : []), "-",
@@ -171,7 +194,11 @@ class ExpiredCodexContinuation extends Error {
   }
 }
 
-export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
+export function createBridge({
+  cwd, execute = execTurn, nodeCommand, delegationTimeoutSeconds = defaultDelegationTimeoutSeconds,
+  now = () => performance.now(), scheduleExpiry = scheduleParkedExpiry,
+}) {
+  const parkedTimeoutMs = delegationTimeout(delegationTimeoutSeconds) * 1000;
   const key = randomUUID();
   const sessions = new Map();
   const busy = new Map();
@@ -236,16 +263,18 @@ export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
         const fingerprint = createHash("sha256").update(JSON.stringify([body.messages, body.tools])).digest("hex");
         const recorded = requests.get(turnKey);
         const parked = delegated.get(session);
+        if (parked?.parked && now() >= parked.parkDeadline) expireDelegation(parked);
         if (recorded?.result && recorded.fingerprint === fingerprint) {
           result = recorded.result;
         } else if (recorded) {
           throw new UncertainCodexTurn();
-        } else if (parked?.parked && parked.delegation.accept(body.messages)) {
+        } else if (parked?.parked && !parked.controller.signal.aborted && parked.delegation.accept(body.messages)) {
           receipt = { fingerprint };
           requests.set(turnKey, receipt);
           turn = parked;
           turn.parked = false;
-          clearTimeout(turn.timeout);
+          turn.cancelExpiry?.();
+          turn.cancelExpiry = undefined;
           ({ result, calls } = await nextDelegated(turn));
           if (result) sessions.set(session, {
             thread: result.thread, history: [...history, { role: "assistant", text: result.text.trim() }],
@@ -280,7 +309,7 @@ export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
             delegated.set(session, turn);
             controller.signal.addEventListener("abort", () => finishDelegation(session, turn), { once: true });
             turn.execution = Promise.resolve().then(() => execute({
-              cwd, thread, signal: controller.signal, nodeCommand,
+              cwd, thread, signal: controller.signal, nodeCommand, delegationTimeoutSeconds,
               prompt: "Use the OpenCode subagent tool for delegation. Follow its instructions for background results.\n\n" + prompt,
               delegationURL: `http://127.0.0.1:${server.address().port}${route}`,
             })).then(result => ({ result }), error => ({ error }));
@@ -342,8 +371,13 @@ export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
       }
     }
   });
+  function expireDelegation(turn) {
+    turn.controller.abort(new DOMException("OpenCode delegation timed out", "TimeoutError"));
+  }
+
   async function finishDelegation(session, turn) {
-    clearTimeout(turn.timeout);
+    turn.cancelExpiry?.();
+    turn.cancelExpiry = undefined;
     endpoints.delete(turn.route);
     turn.delegation.close();
     await turn.execution;
@@ -357,9 +391,15 @@ export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
     if (turn.controller.signal.aborted) throw new Error("Codex interrupted");
     if (outcome.error) throw outcome.error;
     if (outcome.calls) {
+      const current = now();
+      turn.parkDeadline ??= current + parkedTimeoutMs;
+      const remaining = turn.parkDeadline - current;
+      if (remaining <= 0) {
+        expireDelegation(turn);
+        throw turn.controller.signal.reason;
+      }
       turn.parked = true;
-      turn.timeout = setTimeout(() => turn.controller.abort(), 300_000);
-      turn.timeout.unref();
+      turn.cancelExpiry = scheduleExpiry(() => expireDelegation(turn), remaining);
     }
     return outcome;
   }
@@ -378,6 +418,7 @@ export function createBridge({ cwd, execute = execTurn, nodeCommand }) {
 export default {
   id: "ethicnology.codex-cli-preview",
   async setup(ctx) {
+    const delegationTimeoutSeconds = delegationTimeout(ctx.options?.delegationTimeoutSeconds);
     // Status RPC (usage + host load) is independent of the Codex bridge; opt out with { status: false }.
     const status = ctx.options?.status === false ? undefined : await registerStatus(ctx, ctx.options ?? {});
     const disposeStatus = () => {
@@ -387,7 +428,7 @@ export default {
     if (ctx.options?.allowAllDirectories !== true &&
         (!ctx.options?.directory || cwd !== await realpath(ctx.options.directory))) return disposeStatus;
     const nodeCommand = typeof ctx.options?.nodeCommand === "string" ? ctx.options.nodeCommand : undefined;
-    const bridge = createBridge({ cwd, nodeCommand });
+    const bridge = createBridge({ cwd, nodeCommand, delegationTimeoutSeconds });
     bridge.server.listen(0, "127.0.0.1");
     await once(bridge.server, "listening");
     const baseURL = `http://127.0.0.1:${bridge.server.address().port}/v1`;

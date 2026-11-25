@@ -11,8 +11,9 @@ export function createDelegation(tool, signal) {
     changed = new Promise(resolve => { notify = resolve; });
   };
   const abort = () => {
+    const text = signal.reason?.name === "TimeoutError" ? "OpenCode delegation timed out" : "OpenCode turn interrupted";
     for (const { resolve } of pending.values()) {
-      resolve({ isError: true, content: [{ type: "text", text: "OpenCode turn interrupted" }] });
+      resolve({ isError: true, content: [{ type: "text", text }] });
     }
     pending.clear();
     update();

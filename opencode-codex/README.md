@@ -9,13 +9,14 @@ Experimental local OpenCode 2 plugin, two parts:
 
 - Codex owns its agent loop and local tools, with `danger-full-access` and no interactive CLI approvals for primary turns. If OpenCode offers its `subagent` tool, Codex delegates through that native tool under OpenCode's subagent permissions. This path needs Node on the server's `PATH`, or an absolute executable path in the `nodeCommand` plugin option. OpenCode receives the final Codex text, not incremental text.
 - A Codex thread resumes only when the visible history matches its last confirmed reply. An interruption or other divergence starts a new thread from the visible transcript (truncated to the last 400k characters), without automatically re-executing earlier requests. Request replay protection is in memory and does not survive a server restart.
+- A tool result can continue its matching parked turn, but cannot start a new one if the turn is gone. Only an exact retry can replay an already-completed answer; changed system instructions cannot make a previous chat turn execute again.
 - Auxiliary model calls use isolated, read-only `codex exec --ephemeral` turns. Title requests return a fixed title.
 - Usage reported to OpenCode is an estimate of the visible conversation, not Codex's cumulative per-turn usage, which triggered spurious compactions.
 - Diagnostics: `OPENCODE_CODEX_TRACE=/path/file.jsonl` logs routing decisions (no message content); `OPENCODE_CODEX_TRACE_SHAPE=1` adds message roles and sizes.
 
 ## Status RPC
 
-`POST /api/rpc/ethicnology.status/read?location[directory]=<dir>` with `{"input":{}}`. Usage is cached for 2 minutes; host load is read on every call.
+`POST /api/rpc/ethicnology.status/read?location[directory]=<dir>` with `{"input":{}}`. Host load is read on every call without waiting for account usage. Usage is refreshed in the background, cached for 2 minutes, and marked pending until the first refresh completes.
 
 - Claude: Claude Agent SDK `usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET` (5-hour and 7-day windows), through the Claude Code login, using the SDK shipped with the installed `@openchamber/opencode-claude` (override with the `claudeSdk` option). Experimental upstream: expect breakage on SDK updates; the pill then shows `Claude ?`.
 - Codex: App Server `account/rateLimits/read` (weekly window).

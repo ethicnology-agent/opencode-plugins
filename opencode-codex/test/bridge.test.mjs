@@ -6,8 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createBridge } from '../index.mjs';
 
-async function start(t, execute) {
-  const bridge = createBridge({ cwd: '/tmp', execute });
+async function start(t, execute, options = {}) {
+  const bridge = createBridge({ cwd: '/tmp', execute, ...options });
   bridge.server.listen(0, '127.0.0.1');
   await once(bridge.server, 'listening');
   t.after(() => bridge.close());
@@ -31,6 +31,29 @@ async function start(t, execute) {
 
 const user = content => ({ role: 'user', content });
 const assistant = content => ({ role: 'assistant', content });
+
+function manualClock() {
+  let time = 0;
+  const scheduled = new Set();
+  return {
+    now: () => time,
+    scheduleExpiry(callback, delay) {
+      const entry = { callback, at: time + delay };
+      scheduled.add(entry);
+      return () => scheduled.delete(entry);
+    },
+    advance(ms, fireTimers = true) {
+      time += ms;
+      if (!fireTimers) return;
+      for (const entry of scheduled) {
+        if (entry.at > time) continue;
+        scheduled.delete(entry);
+        entry.callback();
+      }
+    },
+    count: () => scheduled.size,
+  };
+}
 
 function pendingExecution() {
   let entered;
@@ -419,6 +442,86 @@ test('a live delegation can consume one result and replay the completed answer',
   const replay = await post(continuation, { tools });
   assert.equal((await replay.json()).choices[0].message.content, 'Returned once');
   assert.equal(starts, 1);
+});
+
+test('a parked delegation survives the old five-minute limit without restarting', { timeout: 3000 }, async t => {
+  let starts = 0;
+  let observed;
+  const clock = manualClock();
+  const { post } = await start(t, async ({ delegationURL, signal, delegationTimeoutSeconds }) => {
+    starts++;
+    observed = { signal, delegationTimeoutSeconds };
+    const response = await fetch(delegationURL, {
+      method: 'POST',
+      body: JSON.stringify({ method: 'tools/call', params: { name: 'subagent' } }),
+    });
+    const { content } = await response.json();
+    return { thread: 'thread', text: content[0].text };
+  }, clock);
+  const tools = [{ type: 'function', function: { name: 'subagent', parameters: { type: 'object' } } }];
+  const input = [user('Delegate once')];
+  const initial = await post(input, { tools });
+  const message = (await initial.json()).choices[0].message;
+  assert.equal(observed.delegationTimeoutSeconds, 900);
+  assert.equal(clock.count(), 1);
+  clock.advance(310_000);
+  assert.equal(observed.signal.aborted, false);
+  const continuation = [...input, message, { role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'Late result' }];
+  const result = await post(continuation, { tools });
+  assert.equal((await result.json()).choices[0].message.content, 'Late result');
+  assert.equal(clock.count(), 0);
+  assert.equal(starts, 1);
+});
+
+async function assertSecondParkExpires(t, fireTimers) {
+  let starts = 0;
+  let observed;
+  let settle;
+  const stopped = new Promise(resolve => { settle = resolve; });
+  const clock = manualClock();
+  const { post } = await start(t, async ({ delegationURL, signal }) => {
+    starts++;
+    observed = signal;
+    for (let i = 0; i < 2; i++) {
+      const response = await fetch(delegationURL, {
+        method: 'POST',
+        body: JSON.stringify({ method: 'tools/call', params: { name: 'subagent' } }),
+      });
+      const reply = await response.json();
+      if (reply.isError) {
+        settle(reply.content[0].text);
+        throw new Error('Interrupted');
+      }
+    }
+    return { thread: 'thread', text: 'Done' };
+  }, { ...clock, delegationTimeoutSeconds: 1 });
+  const tools = [{ type: 'function', function: { name: 'subagent', parameters: { type: 'object' } } }];
+  const input = [user('Delegate')];
+  const first = (await (await post(input, { tools })).json()).choices[0].message;
+  const toolResult = message => ({ role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'Result' });
+  clock.advance(600);
+  const continuation = [...input, first, toolResult(first)];
+  const second = (await (await post(continuation, { tools })).json()).choices[0].message;
+  assert.equal(clock.count(), 1);
+  clock.advance(401, fireTimers);
+  const late = await post([...continuation, second, toolResult(second)], { tools });
+  assert.equal(observed.aborted, true);
+  assert.equal(await stopped, 'OpenCode delegation timed out');
+  assert.equal(late.status, 400);
+  assert.equal((await late.json()).error.type, 'codex_expired_continuation');
+  assert.equal(clock.count(), 0);
+  assert.equal(starts, 1);
+}
+
+test('a second park cannot extend the original delegation deadline', { timeout: 3000 }, t => assertSecondParkExpires(t, true));
+test('a result after the deadline is rejected even before the expiry callback', { timeout: 3000 }, t => assertSecondParkExpires(t, false));
+
+test('delegation timeout must be a whole number of seconds from 1 to 3600', () => {
+  for (const invalid of [0, 3601, -1, 1.5, '900', null]) {
+    assert.throws(() => createBridge({ cwd: '/tmp', delegationTimeoutSeconds: invalid }), /delegationTimeoutSeconds/);
+  }
+  const bridge = createBridge({ cwd: '/tmp', delegationTimeoutSeconds: 3600 });
+  bridge.close();
 });
 
 test('subagent activity is scoped to the current turn and exposes only display fields', async t => {

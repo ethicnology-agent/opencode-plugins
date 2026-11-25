@@ -22,7 +22,7 @@ async function start(t, execute) {
         'x-opencode-codex-kind': 'primary',
         ...options.headers,
       },
-      body: JSON.stringify({ messages, stream: options.stream ?? false }),
+      body: JSON.stringify({ messages, tools: options.tools, stream: options.stream ?? false }),
       signal: options.signal,
     });
   }
@@ -182,7 +182,7 @@ test('concurrent requests for one session do not execute twice', async t => {
   await pending.started;
   const second = await post([user('First')]);
   assert.equal(second.status, 400);
-  assert.match((await second.json()).error.message, /busy/i);
+  assert.equal((await second.json()).error.type, 'codex_uncertain_turn');
   assert.equal(pending.calls, 1);
   bridge.interrupt('session-1');
   assert.equal((await first).status, 400);
@@ -244,7 +244,7 @@ test('client disconnect aborts the active execution', async t => {
   assert.equal(pending.calls, 1);
 });
 
-test('after a failed resumed turn the next turn resumes the same thread and resends pending user messages', async t => {
+test('after a failed resumed turn the next turn seeds a fresh thread', async t => {
   const calls = [];
   const { post } = await start(t, async args => {
     calls.push(args);
@@ -256,8 +256,8 @@ test('after a failed resumed turn the next turn resumes the same thread and rese
   assert.equal(calls[1].thread, 'thread-1');
   const retry = await post([user('First'), assistant('answer'), user('Second'), user('Third')]);
   assert.equal(retry.status, 200);
-  assert.equal(calls[2].thread, 'thread-1');
-  assert.match(calls[2].prompt, /interrupted[\s\S]*Second[\s\S]*Latest message:\nThird$/);
+  assert.equal(calls[2].thread, undefined);
+  assert.match(calls[2].prompt, /Do not repeat their actions[\s\S]*Second[\s\S]*New user message:\nThird$/);
 });
 
 test('a failed first turn reseeds on the next turn', async t => {
@@ -273,7 +273,7 @@ test('a failed first turn reseeds on the next turn', async t => {
   assert.match(calls[1].prompt, /<transcript>[\s\S]*First[\s\S]*Again$/);
 });
 
-test('after an interruption of a resumed turn the next turn keeps the thread', async t => {
+test('after an interruption of a resumed turn the next turn seeds a fresh thread', async t => {
   let calls = [];
   let block = false;
   const { bridge, post } = await start(t, args => {
@@ -289,8 +289,44 @@ test('after an interruption of a resumed turn the next turn keeps the thread', a
   assert.equal((await second).status, 400);
   block = false;
   assert.equal((await post([user('First'), assistant('answer'), user('Slow'), user('Steer')])).status, 200);
-  assert.equal(calls[2].thread, 'thread-1');
-  assert.match(calls[2].prompt, /Slow[\s\S]*Latest message:\nSteer$/);
+  assert.equal(calls[2].thread, undefined);
+  assert.match(calls[2].prompt, /Do not repeat their actions[\s\S]*Slow[\s\S]*New user message:\nSteer$/);
+});
+
+test('a disconnected turn with an observable effect is never executed again', async t => {
+  let effects = 0;
+  let resolveStarted;
+  const started = new Promise(resolve => { resolveStarted = resolve; });
+  const { post } = await start(t, async ({ signal }) => {
+    effects++;
+    resolveStarted();
+    if (effects > 1) return { thread: 'duplicate', text: 'Repeated effect' };
+    await once(signal, 'abort');
+    throw new Error('Disconnected after the effect');
+  });
+  const controller = new AbortController();
+  const input = [user('Perform the effect once')];
+  const first = assert.rejects(post(input, { signal: controller.signal }), { name: 'AbortError' });
+  await started;
+  controller.abort();
+  await first;
+  const replay = await post(input);
+  assert.equal(replay.status, 400);
+  assert.equal((await replay.json()).error.type, 'codex_uncertain_turn');
+  assert.equal(effects, 1);
+});
+
+test('a completed request can be recovered without repeating execution', async t => {
+  let effects = 0;
+  const { post } = await start(t, async () => {
+    effects++;
+    return { thread: 'thread', text: 'Completed once' };
+  });
+  const input = [user('Perform the effect once')];
+  assert.equal((await post(input)).status, 200);
+  const replay = await post(input);
+  assert.equal((await replay.json()).choices[0].message.content, 'Completed once');
+  assert.equal(effects, 1);
 });
 
 test('subagent activity is scoped to the current turn and exposes only display fields', async t => {
@@ -342,4 +378,74 @@ test('keeps the last collaboration action when Codex omits agent identifiers', a
   assert.deepEqual(bridge.activity('session-1'), {
     running: false, waiting: false, lastAction: 'wait', agents: [],
   });
+});
+
+test('cancellation holds a delegated session until its executor settles', async t => {
+  let resolveStarted;
+  let resolveStopped;
+  const started = new Promise(resolve => { resolveStarted = resolve; });
+  const stopped = new Promise(resolve => { resolveStopped = resolve; });
+  let calls = 0;
+  const { bridge, post } = await start(t, async () => {
+    if (++calls === 1) {
+      resolveStarted();
+      await stopped;
+    }
+    return { thread: 'thread', text: 'Done' };
+  });
+  const tools = [{ type: 'function', function: { name: 'subagent', parameters: { type: 'object' } } }];
+  const first = post([user('Slow')], { tools });
+  try {
+    await started;
+    bridge.interrupt('session-1');
+    assert.equal((await post([user('Next')])).status, 400);
+    assert.equal(calls, 1);
+  } finally {
+    resolveStopped();
+    await first;
+  }
+  assert.equal((await post([user('Next')])).status, 200);
+  assert.equal(calls, 2);
+});
+
+test('closing a tool continuation aborts the Codex turn that owns its call', { timeout: 3000 }, async t => {
+  let calls = 0;
+  let acceptResult;
+  const accepted = new Promise(resolve => { acceptResult = resolve; });
+  let confirmAbort;
+  const aborted = new Promise(resolve => { confirmAbort = resolve; });
+  let turnSignal;
+  const { bridge, post } = await start(t, async ({ delegationURL, signal, onCollaboration }) => {
+    if (++calls > 1) return { thread: 'next', text: 'Done' };
+    assert.equal(onCollaboration, undefined);
+    turnSignal = signal;
+    const stopping = once(signal, 'abort');
+    const response = await fetch(delegationURL, {
+      method: 'POST',
+      body: JSON.stringify({ method: 'tools/call', params: { name: 'subagent' } }),
+    });
+    acceptResult(await response.json());
+    await stopping;
+    confirmAbort();
+    throw new Error('Cancelled');
+  });
+  const tools = [{ type: 'function', function: { name: 'subagent', parameters: { type: 'object' } } }];
+  const input = [user('Delegate')];
+  const response = await post(input, { tools });
+  const message = (await response.json()).choices[0].message;
+  assert.deepEqual(bridge.activity('session-1'), { running: false, waiting: false, agents: [] });
+  const replay = await post(input, { tools });
+  assert.equal(replay.status, 400);
+  assert.equal((await replay.json()).error.type, 'codex_uncertain_turn');
+  assert.equal(turnSignal.aborted, false);
+  const controller = new AbortController();
+  const continuation = assert.rejects(post([...input, message, {
+    role: 'tool', tool_call_id: message.tool_calls[0].id, content: 'Ready',
+  }], { tools, signal: controller.signal }), { name: 'AbortError' });
+  assert.equal((await accepted).content[0].text, 'Ready');
+  controller.abort();
+  await continuation;
+  await aborted;
+  assert.equal(turnSignal.aborted, true);
+  assert.equal(calls, 1);
 });

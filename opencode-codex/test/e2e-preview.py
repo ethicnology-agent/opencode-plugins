@@ -89,8 +89,8 @@ try:
     texts = [' '.join(p.get('text', '') for p in i.get('content') or [] if p.get('type') == 'text')
              for i in messages(sid) if i.get('type') == 'assistant']
     m = modes(sid, n)
-    check('steer: both prompts answered on the same Codex thread',
-          any('SECOND' in t for t in texts[:2]) and m and all(x.startswith('resume') for x in m),
+    check('steer: latest prompt is answered whether the prior turn completed or was interrupted',
+          any('SECOND' in t for t in texts[:2]) and m and all(x in ('resume', 'seed') for x in m),
           f'modes={m} latest={texts[:2]}')
 
     # 3. Interrupt a running turn, then continue in the same session.
@@ -101,8 +101,8 @@ try:
     wait(sid)
     leftover = subprocess.run(['pgrep', '-f', 'codex exec.*resume'], capture_output=True, text=True).stdout.split()
     a = turn(sid, 'Reply with exactly AFTER-INTERRUPT.')
-    check('interrupt: no Codex process left, next turn works on the same thread',
-          'AFTER-INTERRUPT' in a and not leftover and modes(sid, n)[-1].startswith('resume'),
+    check('interrupt: no Codex process left, next turn reseeds from visible history',
+          'AFTER-INTERRUPT' in a and not leftover and modes(sid, n)[-1:] == ['seed'],
           f'{a!r} leftover={leftover} modes={modes(sid, n)}')
 
     # 4. Codex -> Claude -> Codex in the same session.
